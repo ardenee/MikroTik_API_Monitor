@@ -103,21 +103,6 @@ Recommended precautions:
 - Restrict RouterOS API/REST services by source IP address.
 - Use HTTPS where practical.
 
-## Suggested `.gitignore` Items
-
-Depending on how the local configuration is stored, files like these should normally be excluded from Git:
-
-```gitignore
-.env
-.env.*
-config.php
-config.local.php
-*.log
-/cache/
-/tmp/
-/backups/
-```
-
 ## Development Status
 
 This repository is currently a work in progress.
