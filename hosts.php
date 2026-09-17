@@ -41,18 +41,28 @@ function sampleHost($h,$u,$p,$v,$t,$delay,string $ip): array {
     return ['ok'=>true,'refreshedAt'=>date('Y-m-d H:i:s'),'sampleSeconds'=>$seconds,'download_bps'=>$downTotal,'upload_bps'=>$upTotal,'download_text'=>formatBitsPerSecond($downTotal),'upload_text'=>formatBitsPerSecond($upTotal),'connections'=>$rows];
 }
 
-// Reverse DNS is cached only for the current PHP login session. Negative lookups are cached too.
+// Reverse DNS is cached only for the current PHP login session. Release the PHP
+// session lock before the potentially slow resolver call so live AJAX polling is
+// never queued behind DNS.
 if(isset($_GET['dns'])){
     header('Content-Type: application/json; charset=utf-8');
     $dnsIp=trim((string)$_GET['dns']);
     if(filter_var($dnsIp,FILTER_VALIDATE_IP,FILTER_FLAG_IPV4)===false){http_response_code(400);echo json_encode(['ok'=>false,'error'=>'Invalid IP']);exit;}
     if(!isset($_SESSION['rdns_cache'])||!is_array($_SESSION['rdns_cache']))$_SESSION['rdns_cache']=[];
-    $cached=array_key_exists($dnsIp,$_SESSION['rdns_cache']);
-    if($cached){$hostname=(string)$_SESSION['rdns_cache'][$dnsIp];}
-    else{$resolved=@gethostbyaddr($dnsIp);$hostname=($resolved!==false&&strcasecmp($resolved,$dnsIp)!==0)?rtrim((string)$resolved,'.'):'';$_SESSION['rdns_cache'][$dnsIp]=$hostname;}
-    echo json_encode(['ok'=>true,'ip'=>$dnsIp,'hostname'=>$hostname,'cached'=>$cached],JSON_UNESCAPED_SLASHES);exit;
+    if(array_key_exists($dnsIp,$_SESSION['rdns_cache'])){$hostname=(string)$_SESSION['rdns_cache'][$dnsIp];session_write_close();echo json_encode(['ok'=>true,'ip'=>$dnsIp,'hostname'=>$hostname,'cached'=>true],JSON_UNESCAPED_SLASHES);exit;}
+    session_write_close();
+    $resolved=@gethostbyaddr($dnsIp);
+    $hostname=($resolved!==false&&strcasecmp($resolved,$dnsIp)!==0)?rtrim((string)$resolved,'.'):'';
+    session_start();
+    if(!isset($_SESSION['rdns_cache'])||!is_array($_SESSION['rdns_cache']))$_SESSION['rdns_cache']=[];
+    $_SESSION['rdns_cache'][$dnsIp]=$hostname;
+    session_write_close();
+    echo json_encode(['ok'=>true,'ip'=>$dnsIp,'hostname'=>$hostname,'cached'=>false],JSON_UNESCAPED_SLASHES);exit;
 }
 
+// The RouterOS sampling request also takes about a second. It only needs the
+// credentials copied above, so release the session lock before doing network I/O.
+session_write_close();
 $ip=trim((string)($_GET['ip']??''));$iface=trim((string)($_GET['iface']??''));$ajax=($_GET['ajax']??'')==='1';$data=null;$error=null;
 try{if(filter_var($ip,FILTER_VALIDATE_IP,FILTER_FLAG_IPV4)===false)throw new RuntimeException('Invalid or missing host IP.');$data=sampleHost($routerHost,$routerUser,$routerPass,$verifyTls,$timeoutSec,$sampleDelayUs,$ip);}catch(Throwable $e){$error=$e->getMessage();}
 if($ajax){header('Content-Type: application/json; charset=utf-8',true,$error?500:200);echo json_encode($error?['ok'=>false,'error'=>$error]:$data,JSON_UNESCAPED_SLASHES);exit;}
@@ -66,8 +76,8 @@ $back=$iface!==''?'interface.php?iface='.rawurlencode($iface):'index.php';
 <div class="topbar"><div><h1>Host: <?=h($ip)?></h1><div class="muted small">Live traffic since this page was opened · <span id="when"></span></div></div><a href="<?=h($back)?>">Back to interface</a></div>
 <?php if($error):?><div class="card error"><?=h($error)?></div><?php else:?>
 <section class="card"><h2>Host Traffic</h2><div class="stats"><div class="stat"><div class="label">Download</div><div class="value rx" id="down">—</div></div><div class="stat"><div class="label">Upload</div><div class="value tx" id="up">—</div></div><div class="stat"><div class="label">Viewed Download</div><div class="value" id="downTotal">0 B</div></div><div class="stat"><div class="label">Viewed Upload</div><div class="value" id="upTotal">0 B</div></div><div class="stat"><div class="label">Connections Seen</div><div class="value" id="seenCount">0</div></div></div><canvas id="graph" class="graph" width="1600" height="220"></canvas><div class="muted small" style="margin-top:8px">Graph scale automatically follows the highest rate currently visible; the top line is the graph maximum. Totals use RouterOS conntrack counters across successive live polls; multicast/broadcast discovery traffic is hidden.</div></section>
-<section class="card"><div class="topbar"><div><h2>Inbound Connections / History</h2><div class="muted small" style="margin-top:8px">Grouped by remote IP + local port. Reverse DNS is cached for this login session only.</div></div><label class="filter"><input type="checkbox" id="hideZero"> Hide 0 byte connections</label></div><div class="table-wrap" style="margin-top:14px"><table id="inboundTable"><thead><tr><th class="sortable" data-sort="protocol">Protocol</th><th class="sortable" data-sort="remote_ip">Remote IP</th><th class="sortable" data-sort="dns">DNS / Hostname</th><th class="sortable" data-sort="local_port">Local Port</th><th class="sortable" data-sort="connection_count">Connections</th><th class="sortable" data-sort="download_bps">Download</th><th class="sortable" data-sort="upload_bps">Upload</th><th class="sortable" data-sort="download_total">Viewed Download</th><th class="sortable" data-sort="upload_total">Viewed Upload</th></tr></thead><tbody id="inboundBody"></tbody></table></div></section>
-<section class="card"><div class="topbar"><div><h2>Outbound Connections / History</h2><div class="muted small" style="margin-top:8px">Grouped by remote IP + remote port. Reverse DNS is cached for this login session only.</div></div></div><div class="table-wrap" style="margin-top:14px"><table id="outboundTable"><thead><tr><th class="sortable" data-sort="protocol">Protocol</th><th class="sortable" data-sort="remote_ip">Remote IP</th><th class="sortable" data-sort="dns">DNS / Hostname</th><th class="sortable" data-sort="remote_port">Remote Port</th><th class="sortable" data-sort="connection_count">Connections</th><th class="sortable" data-sort="download_bps">Download</th><th class="sortable" data-sort="upload_bps">Upload</th><th class="sortable" data-sort="download_total">Viewed Download</th><th class="sortable" data-sort="upload_total">Viewed Upload</th></tr></thead><tbody id="outboundBody"></tbody></table></div></section>
+<section class="card"><div class="topbar"><div><h2>Inbound Connections / History</h2><div class="muted small" style="margin-top:8px">Grouped by remote IP + local port. Reverse DNS runs independently and is cached for this login session only.</div></div><label class="filter"><input type="checkbox" id="hideZero"> Hide 0 byte connections</label></div><div class="table-wrap" style="margin-top:14px"><table id="inboundTable"><thead><tr><th class="sortable" data-sort="protocol">Protocol</th><th class="sortable" data-sort="remote_ip">Remote IP</th><th class="sortable" data-sort="dns">DNS / Hostname</th><th class="sortable" data-sort="local_port">Local Port</th><th class="sortable" data-sort="connection_count">Connections</th><th class="sortable" data-sort="download_bps">Download</th><th class="sortable" data-sort="upload_bps">Upload</th><th class="sortable" data-sort="download_total">Viewed Download</th><th class="sortable" data-sort="upload_total">Viewed Upload</th></tr></thead><tbody id="inboundBody"></tbody></table></div></section>
+<section class="card"><div class="topbar"><div><h2>Outbound Connections / History</h2><div class="muted small" style="margin-top:8px">Grouped by remote IP + remote port. Reverse DNS runs independently and is cached for this login session only.</div></div></div><div class="table-wrap" style="margin-top:14px"><table id="outboundTable"><thead><tr><th class="sortable" data-sort="protocol">Protocol</th><th class="sortable" data-sort="remote_ip">Remote IP</th><th class="sortable" data-sort="dns">DNS / Hostname</th><th class="sortable" data-sort="remote_port">Remote Port</th><th class="sortable" data-sort="connection_count">Connections</th><th class="sortable" data-sort="download_bps">Download</th><th class="sortable" data-sort="upload_bps">Upload</th><th class="sortable" data-sort="download_total">Viewed Download</th><th class="sortable" data-sort="upload_total">Viewed Upload</th></tr></thead><tbody id="outboundBody"></tbody></table></div></section>
 <?php endif;?></div>
 <script>
 window.__initial=<?=json_encode($data,JSON_UNESCAPED_SLASHES)?>;
