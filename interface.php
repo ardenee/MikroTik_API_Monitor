@@ -1,467 +1,55 @@
 <?php
 session_start();
 
-// =========================
-// Configuration
-// =========================
 $routerHost = '192.168.0.1:8443';
 $verifyTls = false;
 $timeoutSec = 10;
 $sampleDelayUs = 1000000;
-
 $routerUser = (string)($_SESSION['router_user'] ?? '');
 $routerPass = (string)($_SESSION['router_pass'] ?? '');
+if ($routerUser === '' || $routerPass === '') { header('Location: index.php'); exit; }
 
-if ($routerUser === '' || $routerPass === '') {
-    header('Location: index.php');
-    exit;
+function h(?string $v): string { return htmlspecialchars((string)$v, ENT_QUOTES, 'UTF-8'); }
+function normalizeBoolString($v): bool { return in_array(strtolower((string)$v), ['true','yes','on'], true); }
+function formatBytes(float $b, int $p=2): string { $u=['B','KB','MB','GB','TB','PB']; $b=max(0,$b); $n=$b>0?floor(log($b,1024)):0; $n=min($n,count($u)-1); return round($b/(1024**$n),$p).' '.$u[$n]; }
+function formatBitsPerSecond(float $b, int $p=2): string { $u=['bps','Kbps','Mbps','Gbps','Tbps']; $b=max(0,$b); $n=$b>0?floor(log($b,1000)):0; $n=min($n,count($u)-1); return round($b/(1000**$n),$p).' '.$u[$n]; }
+function routerosRequest($host,$user,$pass,$verify,$timeout,$path,$method='GET',?array $payload=null): array {
+    $ch=curl_init('https://'.$host.'/rest'.$path);
+    curl_setopt_array($ch,[CURLOPT_RETURNTRANSFER=>true,CURLOPT_CUSTOMREQUEST=>strtoupper($method),CURLOPT_USERPWD=>$user.':'.$pass,CURLOPT_HTTPAUTH=>CURLAUTH_BASIC,CURLOPT_TIMEOUT=>$timeout,CURLOPT_CONNECTTIMEOUT=>$timeout,CURLOPT_HTTPHEADER=>['Content-Type: application/json']]);
+    if(!$verify){curl_setopt($ch,CURLOPT_SSL_VERIFYPEER,false);curl_setopt($ch,CURLOPT_SSL_VERIFYHOST,false);} if($payload!==null)curl_setopt($ch,CURLOPT_POSTFIELDS,json_encode($payload,JSON_UNESCAPED_SLASHES));
+    $response=curl_exec($ch); $err=curl_error($ch); $code=(int)curl_getinfo($ch,CURLINFO_HTTP_CODE);
+    if($response===false)throw new RuntimeException('cURL error: '.$err); $decoded=json_decode($response,true);
+    if($code>=400)throw new RuntimeException('RouterOS HTTP '.$code.': '.(is_array($decoded)?json_encode($decoded,JSON_UNESCAPED_SLASHES):$response));
+    if($decoded===null&&trim($response)!=='null'&&json_last_error()!==JSON_ERROR_NONE)throw new RuntimeException('Invalid JSON from RouterOS: '.json_last_error_msg()); return is_array($decoded)?$decoded:[];
 }
-
-// =========================
-// Helpers
-// =========================
-function h(?string $value): string
-{
-    return htmlspecialchars((string)$value, ENT_QUOTES, 'UTF-8');
+function fetchInterfaceCounters($h,$u,$p,$v,$t,$n): array { $r=routerosRequest($h,$u,$p,$v,$t,'/interface/print','POST',['stats-detail'=>'','.query'=>['name='.$n],'.proplist'=>'.id,name,comment,type,disabled,running,mtu,l2mtu,mac-address,last-link-up-time,last-link-down-time,link-downs,rx-byte,tx-byte,rx-packet,tx-packet,tx-queue-drop,fp-rx-byte,fp-tx-byte']); return $r[0]??[]; }
+function fetchBridgeHosts($h,$u,$p,$v,$t,$n): array { $rows=routerosRequest($h,$u,$p,$v,$t,'/interface/bridge/host/print','POST',['.proplist'=>'mac-address,on-interface,bridge,vid,age,hw-offload']);$r=[];foreach($rows as $x)if(($x['on-interface']??'')===$n&&!empty($x['mac-address']))$r[strtoupper((string)$x['mac-address'])]=$x;return $r; }
+function fetchArp($h,$u,$p,$v,$t): array { return routerosRequest($h,$u,$p,$v,$t,'/ip/arp/print','POST',['.proplist'=>'address,mac-address,interface,status,dynamic,dhcp,complete']); }
+function fetchLeases($h,$u,$p,$v,$t): array { return routerosRequest($h,$u,$p,$v,$t,'/ip/dhcp-server/lease/print','POST',['.proplist'=>'address,active-address,mac-address,active-mac-address,host-name,comment,status,last-seen,expires-after']); }
+function fetchConnections($h,$u,$p,$v,$t): array { return routerosRequest($h,$u,$p,$v,$t,'/ip/firewall/connection/print','POST',['.proplist'=>'.id,protocol,src-address,dst-address,src-port,dst-port,reply-src-address,reply-dst-address,reply-src-port,reply-dst-port,orig-bytes,repl-bytes,orig-rate,repl-rate,srcnat,dstnat,tcp-state,timeout,fasttrack,assured,seen-reply']); }
+function connectionKey(array $r): string { return (string)($r['.id']??implode('|',[$r['protocol']??'',$r['src-address']??'',$r['src-port']??'',$r['dst-address']??'',$r['dst-port']??'',$r['reply-src-address']??'',$r['reply-dst-address']??''])); }
+function isPrivateIpv4(string $ip): bool { return filter_var($ip,FILTER_VALIDATE_IP,FILTER_FLAG_IPV4)!==false && filter_var($ip,FILTER_VALIDATE_IP,FILTER_FLAG_NO_PRIV_RANGE|FILTER_FLAG_NO_RES_RANGE)===false; }
+function isPublicIpv4(string $ip): bool { return filter_var($ip,FILTER_VALIDATE_IP,FILTER_FLAG_IPV4|FILTER_FLAG_NO_PRIV_RANGE|FILTER_FLAG_NO_RES_RANGE)!==false; }
+function emptyHost(string $ip,string $mac=''): array { return ['ip'=>$ip,'mac'=>$mac,'hostname'=>'','comment'=>'','arp_status'=>'','download_bps'=>0,'upload_bps'=>0,'connections'=>0,'remote_count'=>0,'remotes'=>[]]; }
+function buildKnownHosts(array $bridge,array $arp,array $leases,string $iface,bool $wan): array {
+    $hosts=[]; foreach($arp as $r){$ip=trim((string)($r['address']??''));$mac=strtoupper(trim((string)($r['mac-address']??'')));if($ip===''||!isPrivateIpv4($ip))continue;$direct=($r['interface']??'')===$iface;$behind=$mac!==''&&isset($bridge[$mac]);if(!$wan&&!$direct&&!$behind)continue;$hosts[$ip]=emptyHost($ip,$mac);$hosts[$ip]['arp_status']=(string)($r['status']??'');}
+    foreach($leases as $r){$mac=strtoupper(trim((string)($r['active-mac-address']??$r['mac-address']??'')));$ip=trim((string)($r['active-address']??$r['address']??''));if($ip===''||!isPrivateIpv4($ip))continue;if(!$wan&&!isset($hosts[$ip])&&!($mac!==''&&isset($bridge[$mac])))continue;if(!isset($hosts[$ip]))$hosts[$ip]=emptyHost($ip,$mac);if($hosts[$ip]['mac']===''&&$mac!=='')$hosts[$ip]['mac']=$mac;$hosts[$ip]['hostname']=(string)($r['host-name']??'');$hosts[$ip]['comment']=(string)($r['comment']??'');} return $hosts;
 }
-
-function normalizeBoolString($value): bool
-{
-    return in_array(strtolower((string)$value), ['true', 'yes', 'on'], true);
-}
-
-function formatBytes(float $bytes, int $precision = 2): string
-{
-    $units = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
-    $bytes = max(0, $bytes);
-    $pow = $bytes > 0 ? floor(log($bytes, 1024)) : 0;
-    $pow = min($pow, count($units) - 1);
-    return round($bytes / (1024 ** $pow), $precision) . ' ' . $units[$pow];
-}
-
-function formatBitsPerSecond(float $bps, int $precision = 2): string
-{
-    $units = ['bps', 'Kbps', 'Mbps', 'Gbps', 'Tbps'];
-    $bps = max(0, $bps);
-    $pow = $bps > 0 ? floor(log($bps, 1000)) : 0;
-    $pow = min($pow, count($units) - 1);
-    return round($bps / (1000 ** $pow), $precision) . ' ' . $units[$pow];
-}
-
-function routerosRequest($host, $user, $pass, $verify, $timeout, $path, $method = 'GET', ?array $payload = null): array
-{
-    $ch = curl_init('https://' . $host . '/rest' . $path);
-    curl_setopt_array($ch, [
-        CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_CUSTOMREQUEST => strtoupper($method),
-        CURLOPT_USERPWD => $user . ':' . $pass,
-        CURLOPT_HTTPAUTH => CURLAUTH_BASIC,
-        CURLOPT_TIMEOUT => $timeout,
-        CURLOPT_CONNECTTIMEOUT => $timeout,
-        CURLOPT_HTTPHEADER => ['Content-Type: application/json'],
-    ]);
-
-    if (!$verify) {
-        curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, false);
-        curl_setopt($ch, CURLOPT_SSL_VERIFYHOST, false);
+function buildLiveTraffic(array $a,array $b,float $seconds,array $known,bool $wan): array {
+    $first=[];foreach($a as $r)$first[connectionKey($r)]=$r;$hosts=$known;$active=[];$connections=[];
+    foreach($b as $r){$key=connectionKey($r);if(!isset($first[$key]))continue;$old=$first[$key];$up=max(0,(float)($r['orig-bytes']??0)-(float)($old['orig-bytes']??0))*8/$seconds;$down=max(0,(float)($r['repl-bytes']??0)-(float)($old['repl-bytes']??0))*8/$seconds;
+        $src=trim((string)($r['src-address']??''));$dst=trim((string)($r['dst-address']??''));$replySrc=trim((string)($r['reply-src-address']??''));$replyDst=trim((string)($r['reply-dst-address']??''));$local='';$remote='';$upload=$up;$download=$down;$localPort='';$remotePort='';
+        if($wan){ if(isPrivateIpv4($src)&&isPublicIpv4($dst)){ $local=$src;$remote=$dst;$localPort=(string)($r['src-port']??'');$remotePort=(string)($r['dst-port']??''); } elseif(isPublicIpv4($src)&&isPrivateIpv4($replyDst)){ $local=$replyDst;$remote=$src;$upload=$down;$download=$up;$localPort=(string)($r['reply-dst-port']??'');$remotePort=(string)($r['src-port']??''); } else continue; }
+        else { if(isset($hosts[$src])){$local=$src;$remote=$dst;$localPort=(string)($r['src-port']??'');$remotePort=(string)($r['dst-port']??'');} elseif(isset($hosts[$dst])){$local=$dst;$remote=$src;$upload=$down;$download=$up;$localPort=(string)($r['dst-port']??'');$remotePort=(string)($r['src-port']??'');} else continue; }
+        if(!isset($hosts[$local]))$hosts[$local]=emptyHost($local);$active[$local]=true;$hosts[$local]['upload_bps']+=$upload;$hosts[$local]['download_bps']+=$download;$hosts[$local]['connections']++;if($remote!=='')$hosts[$local]['remotes'][$remote]=true;
+        $connections[]=['protocol'=>(string)($r['protocol']??''),'local_ip'=>$local,'remote_ip'=>$remote,'local_port'=>$localPort,'remote_port'=>$remotePort,'download_bps'=>$download,'upload_bps'=>$upload,'download_text'=>formatBitsPerSecond($download),'upload_text'=>formatBitsPerSecond($upload),'tcp_state'=>(string)($r['tcp-state']??''),'timeout'=>(string)($r['timeout']??'')];
     }
-
-    if ($payload !== null) {
-        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($payload, JSON_UNESCAPED_SLASHES));
-    }
-
-    $response = curl_exec($ch);
-    $curlError = curl_error($ch);
-    $httpCode = (int)curl_getinfo($ch, CURLINFO_HTTP_CODE);
-
-    if ($response === false) {
-        throw new RuntimeException('cURL error: ' . $curlError);
-    }
-
-    $decoded = json_decode($response, true);
-    if ($httpCode >= 400) {
-        $detail = is_array($decoded) ? json_encode($decoded, JSON_UNESCAPED_SLASHES) : $response;
-        throw new RuntimeException('RouterOS HTTP ' . $httpCode . ': ' . $detail);
-    }
-
-    if ($decoded === null && trim($response) !== 'null' && json_last_error() !== JSON_ERROR_NONE) {
-        throw new RuntimeException('Invalid JSON from RouterOS: ' . json_last_error_msg());
-    }
-
-    return is_array($decoded) ? $decoded : [];
+    if($wan)$hosts=array_intersect_key($hosts,$active); foreach($hosts as &$x){$x['remote_count']=count($x['remotes']);$x['remotes']=array_slice(array_keys($x['remotes']),0,8);$x['download_text']=formatBitsPerSecond($x['download_bps']);$x['upload_text']=formatBitsPerSecond($x['upload_bps']);$x['total_bps']=$x['download_bps']+$x['upload_bps'];}unset($x);usort($hosts,fn($x,$y)=>$y['total_bps']<=>$x['total_bps']);usort($connections,fn($x,$y)=>(($y['download_bps']+$y['upload_bps'])<=>($x['download_bps']+$x['upload_bps'])));return ['hosts'=>array_values($hosts),'connections'=>array_slice($connections,0,300)];
 }
-
-function fetchInterfaceCounters($host, $user, $pass, $verify, $timeout, $name): array
-{
-    $rows = routerosRequest($host, $user, $pass, $verify, $timeout, '/interface/print', 'POST', [
-        'stats-detail' => '',
-        '.query' => ['name=' . $name],
-        '.proplist' => '.id,name,comment,type,disabled,running,mtu,l2mtu,mac-address,last-link-up-time,last-link-down-time,link-downs,rx-byte,tx-byte,rx-packet,tx-packet,tx-queue-drop,fp-rx-byte,fp-tx-byte',
-    ]);
-    return $rows[0] ?? [];
+function buildPayload($h,$u,$p,$v,$t,$delay,$name): array {
+    $i1=fetchInterfaceCounters($h,$u,$p,$v,$t,$name);if(!$i1)throw new RuntimeException('Interface not found: '.$name);$hint=strtolower($name.' '.($i1['comment']??''));$wan=str_contains($hint,'wan')||str_contains($hint,'internet')||str_contains($hint,'fiber')||str_contains($hint,'fibre');$bridge=fetchBridgeHosts($h,$u,$p,$v,$t,$name);$arp=fetchArp($h,$u,$p,$v,$t);$leases=fetchLeases($h,$u,$p,$v,$t);$known=buildKnownHosts($bridge,$arp,$leases,$name,$wan);$c1=fetchConnections($h,$u,$p,$v,$t);$started=microtime(true);usleep($delay);$i2=fetchInterfaceCounters($h,$u,$p,$v,$t,$name);$c2=fetchConnections($h,$u,$p,$v,$t);$seconds=max(microtime(true)-$started,.001);$rx=max(0,(float)($i2['rx-byte']??0)-(float)($i1['rx-byte']??0))*8/$seconds;$tx=max(0,(float)($i2['tx-byte']??0)-(float)($i1['tx-byte']??0))*8/$seconds;$live=buildLiveTraffic($c1,$c2,$seconds,$known,$wan);
+    return ['ok'=>true,'refreshedAt'=>date('Y-m-d H:i:s'),'sampleSeconds'=>round($seconds,2),'mode'=>$wan?'WAN / Internet':'LAN / interface hosts','interface'=>['name'=>$name,'comment'=>$i2['comment']??'','type'=>$i2['type']??'','running'=>normalizeBoolString($i2['running']??false),'disabled'=>normalizeBoolString($i2['disabled']??false),'mac'=>$i2['mac-address']??'—','mtu'=>$i2['mtu']??'—','l2mtu'=>$i2['l2mtu']??'—','rx_bps'=>$rx,'tx_bps'=>$tx,'rx_text'=>formatBitsPerSecond($rx),'tx_text'=>formatBitsPerSecond($tx),'rx_total'=>formatBytes((float)($i2['rx-byte']??0)),'tx_total'=>formatBytes((float)($i2['tx-byte']??0)),'rx_packets'=>(float)($i2['rx-packet']??0),'tx_packets'=>(float)($i2['tx-packet']??0),'queue_drops'=>(float)($i2['tx-queue-drop']??0),'link_downs'=>$i2['link-downs']??'0'],'hosts'=>$live['hosts'],'connections'=>$live['connections']];
 }
-
-function fetchBridgeHosts($host, $user, $pass, $verify, $timeout, $name): array
-{
-    $rows = routerosRequest($host, $user, $pass, $verify, $timeout, '/interface/bridge/host/print', 'POST', [
-        '.proplist' => 'mac-address,on-interface,bridge,vid,age,hw-offload',
-    ]);
-    $result = [];
-    foreach ($rows as $row) {
-        if (($row['on-interface'] ?? '') === $name && !empty($row['mac-address'])) {
-            $result[strtoupper((string)$row['mac-address'])] = $row;
-        }
-    }
-    return $result;
-}
-
-function fetchArp($host, $user, $pass, $verify, $timeout): array
-{
-    return routerosRequest($host, $user, $pass, $verify, $timeout, '/ip/arp/print', 'POST', [
-        '.proplist' => 'address,mac-address,interface,status,dynamic,dhcp,complete',
-    ]);
-}
-
-function fetchLeases($host, $user, $pass, $verify, $timeout): array
-{
-    return routerosRequest($host, $user, $pass, $verify, $timeout, '/ip/dhcp-server/lease/print', 'POST', [
-        '.proplist' => 'address,active-address,mac-address,active-mac-address,host-name,comment,status,last-seen,expires-after',
-    ]);
-}
-
-function fetchConnections($host, $user, $pass, $verify, $timeout): array
-{
-    return routerosRequest($host, $user, $pass, $verify, $timeout, '/ip/firewall/connection/print', 'POST', [
-        '.proplist' => '.id,protocol,orig-src-address,orig-dst-address,orig-src-port,orig-dst-port,repl-src-address,repl-dst-address,repl-src-port,repl-dst-port,orig-bytes,repl-bytes,tcp-state,timeout,fasttrack,assured,seen-reply',
-    ]);
-}
-
-function connectionKey(array $row): string
-{
-    return (string)($row['.id'] ?? implode('|', [
-        $row['protocol'] ?? '', $row['orig-src-address'] ?? '', $row['orig-src-port'] ?? '',
-        $row['orig-dst-address'] ?? '', $row['orig-dst-port'] ?? '', $row['repl-src-address'] ?? '',
-        $row['repl-src-port'] ?? '', $row['repl-dst-address'] ?? '', $row['repl-dst-port'] ?? '',
-    ]));
-}
-
-function isPrivateIpv4(string $ip): bool
-{
-    if (filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) === false) {
-        return false;
-    }
-    return filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) === false;
-}
-
-function isPublicIpv4(string $ip): bool
-{
-    return filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4 | FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE) !== false;
-}
-
-function emptyHost(string $ip, string $mac = ''): array
-{
-    return [
-        'ip' => $ip,
-        'mac' => $mac,
-        'hostname' => '',
-        'comment' => '',
-        'arp_status' => '',
-        'download_bps' => 0,
-        'upload_bps' => 0,
-        'connections' => 0,
-        'remote_count' => 0,
-        'remotes' => [],
-    ];
-}
-
-function buildKnownHosts(array $bridgeHosts, array $arpRows, array $leases, string $interfaceName, bool $wanLike): array
-{
-    $hosts = [];
-    $macToIps = [];
-
-    foreach ($arpRows as $row) {
-        $ip = trim((string)($row['address'] ?? ''));
-        $mac = strtoupper(trim((string)($row['mac-address'] ?? '')));
-        if ($ip === '' || !isPrivateIpv4($ip)) {
-            continue;
-        }
-
-        $direct = ($row['interface'] ?? '') === $interfaceName;
-        $behindPort = $mac !== '' && isset($bridgeHosts[$mac]);
-        if (!$wanLike && !$direct && !$behindPort) {
-            continue;
-        }
-
-        $hosts[$ip] = emptyHost($ip, $mac);
-        $hosts[$ip]['arp_status'] = (string)($row['status'] ?? '');
-        if ($mac !== '') {
-            $macToIps[$mac][] = $ip;
-        }
-    }
-
-    foreach ($leases as $row) {
-        $mac = strtoupper(trim((string)($row['active-mac-address'] ?? $row['mac-address'] ?? '')));
-        $ip = trim((string)($row['active-address'] ?? $row['address'] ?? ''));
-        if ($ip === '' || !isPrivateIpv4($ip)) {
-            continue;
-        }
-
-        $allowed = $wanLike || isset($hosts[$ip]) || ($mac !== '' && isset($bridgeHosts[$mac]));
-        if (!$allowed) {
-            continue;
-        }
-
-        if (!isset($hosts[$ip])) {
-            $hosts[$ip] = emptyHost($ip, $mac);
-        }
-        if ($hosts[$ip]['mac'] === '' && $mac !== '') {
-            $hosts[$ip]['mac'] = $mac;
-        }
-        $hosts[$ip]['hostname'] = (string)($row['host-name'] ?? '');
-        $hosts[$ip]['comment'] = (string)($row['comment'] ?? '');
-    }
-
-    return $hosts;
-}
-
-function buildLiveTraffic(array $firstRows, array $secondRows, float $seconds, array $knownHosts, bool $wanLike): array
-{
-    $first = [];
-    foreach ($firstRows as $row) {
-        $first[connectionKey($row)] = $row;
-    }
-
-    $hosts = $knownHosts;
-    $connections = [];
-
-    foreach ($secondRows as $row) {
-        $key = connectionKey($row);
-        if (!isset($first[$key])) {
-            continue;
-        }
-
-        $old = $first[$key];
-        $origBps = max(0, (float)($row['orig-bytes'] ?? 0) - (float)($old['orig-bytes'] ?? 0)) * 8 / $seconds;
-        $replBps = max(0, (float)($row['repl-bytes'] ?? 0) - (float)($old['repl-bytes'] ?? 0)) * 8 / $seconds;
-
-        $origSrc = trim((string)($row['orig-src-address'] ?? ''));
-        $origDst = trim((string)($row['orig-dst-address'] ?? ''));
-        $replSrc = trim((string)($row['repl-src-address'] ?? ''));
-        $replDst = trim((string)($row['repl-dst-address'] ?? ''));
-
-        $localIp = '';
-        $remoteIp = '';
-        $upload = 0.0;
-        $download = 0.0;
-
-        // Normal outbound/NAT connection: original source is the LAN client.
-        if (isset($hosts[$origSrc])) {
-            $localIp = $origSrc;
-            $remoteIp = $origDst;
-            $upload = $origBps;
-            $download = $replBps;
-        } elseif (isset($hosts[$origDst])) {
-            $localIp = $origDst;
-            $remoteIp = $origSrc;
-            $upload = $replBps;
-            $download = $origBps;
-        } elseif (isset($hosts[$replSrc])) {
-            // Typical dst-nat/inbound connection to a LAN server.
-            $localIp = $replSrc;
-            $remoteIp = $origSrc;
-            $upload = $replBps;
-            $download = $origBps;
-        } elseif (isset($hosts[$replDst])) {
-            $localIp = $replDst;
-            $remoteIp = $replSrc;
-            $upload = $origBps;
-            $download = $replBps;
-        } elseif ($wanLike) {
-            // WAN views use the global conntrack table. Prefer a private original
-            // source because that is the pre-NAT LAN client on outbound traffic.
-            if (isPrivateIpv4($origSrc) && isPublicIpv4($origDst)) {
-                $localIp = $origSrc;
-                $remoteIp = $origDst;
-                $upload = $origBps;
-                $download = $replBps;
-            } elseif (isPublicIpv4($origSrc) && isPrivateIpv4($replSrc)) {
-                $localIp = $replSrc;
-                $remoteIp = $origSrc;
-                $upload = $replBps;
-                $download = $origBps;
-            } elseif (isPrivateIpv4($origSrc)) {
-                $localIp = $origSrc;
-                $remoteIp = $origDst;
-                $upload = $origBps;
-                $download = $replBps;
-            }
-
-            if ($localIp !== '' && !isset($hosts[$localIp])) {
-                $hosts[$localIp] = emptyHost($localIp);
-            }
-        }
-
-        if ($localIp === '') {
-            continue;
-        }
-
-        // For WAN mode, suppress purely local/private conversations from the
-        // Internet connection table. They remain visible on LAN interface views.
-        if ($wanLike && !isPublicIpv4($remoteIp)) {
-            continue;
-        }
-
-        $hosts[$localIp]['upload_bps'] += $upload;
-        $hosts[$localIp]['download_bps'] += $download;
-        $hosts[$localIp]['connections']++;
-        if ($remoteIp !== '') {
-            $hosts[$localIp]['remotes'][$remoteIp] = true;
-        }
-
-        $connections[] = [
-            'protocol' => (string)($row['protocol'] ?? ''),
-            'local_ip' => $localIp,
-            'remote_ip' => $remoteIp,
-            'local_port' => $localIp === $origSrc ? (string)($row['orig-src-port'] ?? '') : (string)($row['repl-src-port'] ?? ''),
-            'remote_port' => $localIp === $origSrc ? (string)($row['orig-dst-port'] ?? '') : (string)($row['orig-src-port'] ?? ''),
-            'from' => $origSrc . (!empty($row['orig-src-port']) ? ':' . $row['orig-src-port'] : ''),
-            'to' => $origDst . (!empty($row['orig-dst-port']) ? ':' . $row['orig-dst-port'] : ''),
-            'download_bps' => $download,
-            'upload_bps' => $upload,
-            'download_text' => formatBitsPerSecond($download),
-            'upload_text' => formatBitsPerSecond($upload),
-            'tcp_state' => (string)($row['tcp-state'] ?? ''),
-            'timeout' => (string)($row['timeout'] ?? ''),
-        ];
-    }
-
-    foreach ($hosts as &$host) {
-        $host['remote_count'] = count($host['remotes']);
-        $host['remotes'] = array_slice(array_keys($host['remotes']), 0, 8);
-        $host['download_text'] = formatBitsPerSecond($host['download_bps']);
-        $host['upload_text'] = formatBitsPerSecond($host['upload_bps']);
-        $host['total_bps'] = $host['download_bps'] + $host['upload_bps'];
-    }
-    unset($host);
-
-    usort($hosts, fn($a, $b) => $b['total_bps'] <=> $a['total_bps']);
-    usort($connections, fn($a, $b) => ($b['download_bps'] + $b['upload_bps']) <=> ($a['download_bps'] + $a['upload_bps']));
-
-    return [
-        'hosts' => array_values($hosts),
-        'connections' => array_slice($connections, 0, 300),
-    ];
-}
-
-function buildPayload($host, $user, $pass, $verify, $timeout, $delay, $name): array
-{
-    $interface1 = fetchInterfaceCounters($host, $user, $pass, $verify, $timeout, $name);
-    if (!$interface1) {
-        throw new RuntimeException('Interface not found: ' . $name);
-    }
-
-    $nameHint = strtolower($name . ' ' . ($interface1['comment'] ?? ''));
-    $wanLike = str_contains($nameHint, 'wan') || str_contains($nameHint, 'internet') ||
-        str_contains($nameHint, 'fiber') || str_contains($nameHint, 'fibre');
-
-    $bridgeHosts = fetchBridgeHosts($host, $user, $pass, $verify, $timeout, $name);
-    $arpRows = fetchArp($host, $user, $pass, $verify, $timeout);
-    $leases = fetchLeases($host, $user, $pass, $verify, $timeout);
-    $knownHosts = buildKnownHosts($bridgeHosts, $arpRows, $leases, $name, $wanLike);
-
-    $connections1 = fetchConnections($host, $user, $pass, $verify, $timeout);
-    $started = microtime(true);
-    usleep($delay);
-    $interface2 = fetchInterfaceCounters($host, $user, $pass, $verify, $timeout, $name);
-    $connections2 = fetchConnections($host, $user, $pass, $verify, $timeout);
-    $seconds = max(microtime(true) - $started, 0.001);
-
-    $rxBps = max(0, (float)($interface2['rx-byte'] ?? 0) - (float)($interface1['rx-byte'] ?? 0)) * 8 / $seconds;
-    $txBps = max(0, (float)($interface2['tx-byte'] ?? 0) - (float)($interface1['tx-byte'] ?? 0)) * 8 / $seconds;
-    $live = buildLiveTraffic($connections1, $connections2, $seconds, $knownHosts, $wanLike);
-
-    return [
-        'ok' => true,
-        'refreshedAt' => date('Y-m-d H:i:s'),
-        'sampleSeconds' => round($seconds, 2),
-        'mode' => $wanLike ? 'WAN / Internet' : 'LAN / interface hosts',
-        'interface' => [
-            'name' => $name,
-            'comment' => $interface2['comment'] ?? '',
-            'type' => $interface2['type'] ?? '',
-            'running' => normalizeBoolString($interface2['running'] ?? false),
-            'disabled' => normalizeBoolString($interface2['disabled'] ?? false),
-            'mac' => $interface2['mac-address'] ?? '—',
-            'mtu' => $interface2['mtu'] ?? '—',
-            'l2mtu' => $interface2['l2mtu'] ?? '—',
-            'rx_bps' => $rxBps,
-            'tx_bps' => $txBps,
-            'rx_text' => formatBitsPerSecond($rxBps),
-            'tx_text' => formatBitsPerSecond($txBps),
-            'rx_total' => formatBytes((float)($interface2['rx-byte'] ?? 0)),
-            'tx_total' => formatBytes((float)($interface2['tx-byte'] ?? 0)),
-            'rx_packets' => (float)($interface2['rx-packet'] ?? 0),
-            'tx_packets' => (float)($interface2['tx-packet'] ?? 0),
-            'queue_drops' => (float)($interface2['tx-queue-drop'] ?? 0),
-            'link_downs' => $interface2['link-downs'] ?? '0',
-            'last_up' => $interface2['last-link-up-time'] ?? '—',
-            'last_down' => $interface2['last-link-down-time'] ?? '—',
-        ],
-        'hosts' => $live['hosts'],
-        'connections' => $live['connections'],
-    ];
-}
-
-$interfaceName = trim((string)($_GET['iface'] ?? ''));
-$isAjax = ($_GET['ajax'] ?? '') === '1';
-$data = null;
-$error = null;
-
-try {
-    if ($interfaceName === '') {
-        throw new RuntimeException('Missing interface name.');
-    }
-    $data = buildPayload($routerHost, $routerUser, $routerPass, $verifyTls, $timeoutSec, $sampleDelayUs, $interfaceName);
-} catch (Throwable $e) {
-    $error = $e->getMessage();
-}
-
-if ($isAjax) {
-    header('Content-Type: application/json; charset=utf-8', true, $error ? 500 : 200);
-    echo json_encode($error ? ['ok' => false, 'error' => $error] : $data, JSON_UNESCAPED_SLASHES);
-    exit;
-}
+$interfaceName=trim((string)($_GET['iface']??''));$isAjax=($_GET['ajax']??'')==='1';$data=null;$error=null;try{if($interfaceName==='')throw new RuntimeException('Missing interface name.');$data=buildPayload($routerHost,$routerUser,$routerPass,$verifyTls,$timeoutSec,$sampleDelayUs,$interfaceName);}catch(Throwable $e){$error=$e->getMessage();}if($isAjax){header('Content-Type: application/json; charset=utf-8',true,$error?500:200);echo json_encode($error?['ok'=>false,'error'=>$error]:$data,JSON_UNESCAPED_SLASHES);exit;}
 ?>
-<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>MikroTik Interface Detail</title>
-<style>
-:root{--bg:#0f172a;--panel:#111827;--panel2:#1f2937;--text:#e5e7eb;--muted:#94a3b8;--line:#334155;--green:#22c55e;--red:#ef4444;--accent:#38bdf8}*{box-sizing:border-box}body{margin:0;font:14px Arial,sans-serif;background:var(--bg);color:var(--text)}.wrap{width:min(1700px,calc(100% - 32px));margin:24px auto}.topbar{display:flex;justify-content:space-between;gap:16px;align-items:center;flex-wrap:wrap}.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:14px;padding:18px;margin-top:20px}h1,h2{margin:0}h2{font-size:18px;margin-bottom:14px}.muted{color:var(--muted)}.small{font-size:12px}.mono{font-family:Consolas,monospace}.stats{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:12px}.stat{border:1px solid #33415580;border-radius:10px;padding:12px}.label{color:var(--muted);font-size:12px}.value{font-size:18px;font-weight:700;margin-top:5px}.graph{width:100%;height:180px;background:#0f172a88;border:1px solid #33415580;border-radius:8px;margin-top:15px}.legend{display:flex;gap:20px;margin-top:8px;font-size:12px}.rx{color:#86efac}.tx{color:#fca5a5}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:1050px}th,td{padding:9px 10px;border-bottom:1px solid #33415580;text-align:left;white-space:nowrap}th{color:#cbd5e1;background:#ffffff08;position:sticky;top:0}tbody tr:hover{background:#ffffff08}.error{background:#7f1d1d55;padding:15px;border-radius:10px}a{color:var(--accent)}@media(max-width:1100px){.stats{grid-template-columns:repeat(2,1fr)}}
-</style>
-</head>
-<body>
-<div class="wrap">
-<div class="topbar"><div><h1>Interface Detail: <?= h($interfaceName) ?></h1><div class="muted small">Router <?= h($routerHost) ?> · <span id="when"><?= h($data['refreshedAt'] ?? '') ?></span> · <span id="mode"><?= h($data['mode'] ?? '') ?></span></div></div><div><span id="pollStatus" class="muted small">Live update every 3 seconds · 60 second graph</span> &nbsp; <a href="index.php">Back to dashboard</a></div></div>
-<?php if ($error): ?><div class="card error"><?= h($error) ?></div><?php else: ?>
-<section class="card"><h2>Live Interface Traffic</h2><div class="stats"><div class="stat"><div class="label">Status</div><div class="value" id="status">—</div></div><div class="stat"><div class="label">Download / RX</div><div class="value rx" id="rx">—</div></div><div class="stat"><div class="label">Upload / TX</div><div class="value tx" id="tx">—</div></div><div class="stat"><div class="label">Known IPs</div><div class="value" id="hostCount">0</div></div><div class="stat"><div class="label">Active Connections</div><div class="value" id="connectionCount">0</div></div><div class="stat"><div class="label">Total RX</div><div class="value" id="rxTotal">—</div></div><div class="stat"><div class="label">Total TX</div><div class="value" id="txTotal">—</div></div></div><canvas id="trafficGraph" class="graph" width="1600" height="180"></canvas><div class="legend"><span class="rx">● Download / RX</span><span class="tx">● Upload / TX</span><span class="muted">Rolling 60 seconds</span></div></section>
-<section class="card"><h2>Live Traffic by IP</h2><div class="muted small" style="margin-bottom:12px">WAN mode correlates the global RouterOS connection table with LAN ARP/DHCP clients and shows Internet destinations only. LAN mode remains scoped to hosts on the selected interface.</div><div class="table-wrap"><table><thead><tr><th>IP Address</th><th>Host / Comment</th><th>MAC</th><th>Download</th><th>Upload</th><th>Connections</th><th>Remote IPs</th><th>Current Remotes</th></tr></thead><tbody id="hostsBody"></tbody></table></div></section>
-<section class="card"><h2>Interface Information</h2><div class="stats"><div class="stat"><div class="label">Type</div><div class="value" id="type">—</div></div><div class="stat"><div class="label">MAC</div><div class="value mono" id="mac">—</div></div><div class="stat"><div class="label">MTU / L2MTU</div><div class="value" id="mtu">—</div></div><div class="stat"><div class="label">RX Packets</div><div class="value" id="rxPackets">—</div></div><div class="stat"><div class="label">TX Packets</div><div class="value" id="txPackets">—</div></div><div class="stat"><div class="label">Queue Drops</div><div class="value" id="queueDrops">—</div></div><div class="stat"><div class="label">Link Downs</div><div class="value" id="linkDowns">—</div></div></div></section>
-<section class="card"><h2>Live Connections</h2><div class="table-wrap"><table><thead><tr><th>Protocol</th><th>Local IP</th><th>Local Port</th><th>Remote IP</th><th>Remote Port</th><th>Download</th><th>Upload</th><th>TCP State</th><th>Timeout</th></tr></thead><tbody id="connectionsBody"></tbody></table></div></section>
-<?php endif; ?>
-</div>
-<script>window.__initialPayload=<?= json_encode($data, JSON_UNESCAPED_SLASHES) ?>;</script>
-<script>
-(function(){
-const $=id=>document.getElementById(id),hist=[],maxPts=20;let polling=false;
-function esc(v){return String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;')}
-function draw(){const c=$('trafficGraph');if(!c||!hist.length)return;const x=c.getContext('2d'),w=c.width,h=c.height;x.clearRect(0,0,w,h);let m=1;hist.forEach(p=>m=Math.max(m,p.rx,p.tx));function line(k,col){x.beginPath();x.strokeStyle=col;x.lineWidth=2;hist.forEach((p,i)=>{const px=(i/(maxPts-1))*w,py=h-(p[k]/m)*(h-8)-4;i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke()}line('rx','#22c55e');line('tx','#ef4444')}
-function render(d){if(!d)return;const i=d.interface||{};$('when').textContent=d.refreshedAt||'';$('mode').textContent=d.mode||'';$('status').textContent=i.disabled?'Disabled':(i.running?'Up':'Down');$('rx').textContent=i.rx_text||'—';$('tx').textContent=i.tx_text||'—';$('rxTotal').textContent=i.rx_total||'—';$('txTotal').textContent=i.tx_total||'—';$('type').textContent=i.type||'—';$('mac').textContent=i.mac||'—';$('mtu').textContent=(i.mtu||'—')+' / '+(i.l2mtu||'—');$('rxPackets').textContent=Number(i.rx_packets||0).toLocaleString();$('txPackets').textContent=Number(i.tx_packets||0).toLocaleString();$('queueDrops').textContent=Number(i.queue_drops||0).toLocaleString();$('linkDowns').textContent=i.link_downs||'0';const hosts=d.hosts||[],conns=d.connections||[];$('hostCount').textContent=hosts.length;$('connectionCount').textContent=conns.length;$('hostsBody').innerHTML=hosts.map(r=>'<tr><td class="mono">'+esc(r.ip)+'</td><td>'+esc(r.hostname||r.comment||'—')+'</td><td class="mono">'+esc(r.mac||'—')+'</td><td class="rx">'+esc(r.download_text)+'</td><td class="tx">'+esc(r.upload_text)+'</td><td>'+esc(r.connections)+'</td><td>'+esc(r.remote_count)+'</td><td class="mono">'+esc((r.remotes||[]).join(', ')||'—')+'</td></tr>').join('');$('connectionsBody').innerHTML=conns.map(r=>'<tr><td>'+esc(r.protocol)+'</td><td class="mono">'+esc(r.local_ip)+'</td><td>'+esc(r.local_port||'—')+'</td><td class="mono">'+esc(r.remote_ip)+'</td><td>'+esc(r.remote_port||'—')+'</td><td class="rx">'+esc(r.download_text)+'</td><td class="tx">'+esc(r.upload_text)+'</td><td>'+esc(r.tcp_state||'—')+'</td><td>'+esc(r.timeout||'—')+'</td></tr>').join('');hist.push({rx:Number(i.rx_bps||0),tx:Number(i.tx_bps||0)});if(hist.length>maxPts)hist.shift();draw()}
-async function poll(){if(polling)return;polling=true;$('pollStatus').textContent='Updating...';try{const u=new URL(location.href);u.searchParams.set('ajax','1');u.searchParams.set('t',Date.now());const r=await fetch(u,{cache:'no-store'}),d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'Update failed');render(d);$('pollStatus').textContent='Live update every 3 seconds · 60 second graph'}catch(e){$('pollStatus').textContent='Update failed: '+e.message}finally{polling=false}}
-render(window.__initialPayload);setInterval(poll,3000);
-})();
-</script>
-</body>
-</html>
+<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>MikroTik Interface Detail</title><style>:root{--bg:#0f172a;--panel:#111827;--panel2:#1f2937;--text:#e5e7eb;--muted:#94a3b8;--line:#334155;--green:#22c55e;--red:#ef4444;--accent:#38bdf8}*{box-sizing:border-box}body{margin:0;font:14px Arial,sans-serif;background:var(--bg);color:var(--text)}.wrap{width:min(1700px,calc(100% - 32px));margin:24px auto}.topbar{display:flex;justify-content:space-between;gap:16px;align-items:center;flex-wrap:wrap}.card{background:linear-gradient(180deg,var(--panel),var(--panel2));border:1px solid var(--line);border-radius:14px;padding:18px;margin-top:20px}h1,h2{margin:0}h2{font-size:18px;margin-bottom:14px}.muted{color:var(--muted)}.small{font-size:12px}.mono{font-family:Consolas,monospace}.stats{display:grid;grid-template-columns:repeat(7,minmax(0,1fr));gap:12px}.stat{border:1px solid #33415580;border-radius:10px;padding:12px}.label{color:var(--muted);font-size:12px}.value{font-size:18px;font-weight:700;margin-top:5px}.graph{width:100%;height:180px;background:#0f172a88;border:1px solid #33415580;border-radius:8px;margin-top:15px}.legend{display:flex;gap:20px;margin-top:8px;font-size:12px}.rx{color:#86efac}.tx{color:#fca5a5}.table-wrap{overflow:auto}table{width:100%;border-collapse:collapse;min-width:1050px}th,td{padding:9px 10px;border-bottom:1px solid #33415580;text-align:left;white-space:nowrap}th{color:#cbd5e1;background:#ffffff08;position:sticky;top:0}tbody tr:hover{background:#ffffff08}.error{background:#7f1d1d55;padding:15px;border-radius:10px}a{color:var(--accent)}@media(max-width:1100px){.stats{grid-template-columns:repeat(2,1fr)}}</style></head><body><div class="wrap"><div class="topbar"><div><h1>Interface Detail: <?=h($interfaceName)?></h1><div class="muted small">Router <?=h($routerHost)?> · <span id="when"><?=h($data['refreshedAt']??'')?></span> · <span id="mode"><?=h($data['mode']??'')?></span></div></div><div><span id="pollStatus" class="muted small">Live update every 3 seconds · 60 second graph</span> &nbsp; <a href="index.php">Back to dashboard</a></div></div><?php if($error):?><div class="card error"><?=h($error)?></div><?php else:?><section class="card"><h2>Live Interface Traffic</h2><div class="stats"><div class="stat"><div class="label">Status</div><div class="value" id="status">—</div></div><div class="stat"><div class="label">Download / RX</div><div class="value rx" id="rx">—</div></div><div class="stat"><div class="label">Upload / TX</div><div class="value tx" id="tx">—</div></div><div class="stat"><div class="label">Active IPs</div><div class="value" id="hostCount">0</div></div><div class="stat"><div class="label">Active Connections</div><div class="value" id="connectionCount">0</div></div><div class="stat"><div class="label">Total RX</div><div class="value" id="rxTotal">—</div></div><div class="stat"><div class="label">Total TX</div><div class="value" id="txTotal">—</div></div></div><canvas id="trafficGraph" class="graph" width="1600" height="180"></canvas><div class="legend"><span class="rx">● Download / RX</span><span class="tx">● Upload / TX</span><span class="muted">Rolling 60 seconds</span></div></section><section class="card"><h2>Live Traffic by IP</h2><div class="muted small" style="margin-bottom:12px">WAN mode shows LAN clients with current Internet connections only.</div><div class="table-wrap"><table><thead><tr><th>IP Address</th><th>Host / Comment</th><th>MAC</th><th>Download</th><th>Upload</th><th>Connections</th><th>Remote IPs</th><th>Current Remotes</th></tr></thead><tbody id="hostsBody"></tbody></table></div></section><section class="card"><h2>Interface Information</h2><div class="stats"><div class="stat"><div class="label">Type</div><div class="value" id="type">—</div></div><div class="stat"><div class="label">MAC</div><div class="value mono" id="mac">—</div></div><div class="stat"><div class="label">MTU / L2MTU</div><div class="value" id="mtu">—</div></div><div class="stat"><div class="label">RX Packets</div><div class="value" id="rxPackets">—</div></div><div class="stat"><div class="label">TX Packets</div><div class="value" id="txPackets">—</div></div><div class="stat"><div class="label">Queue Drops</div><div class="value" id="queueDrops">—</div></div><div class="stat"><div class="label">Link Downs</div><div class="value" id="linkDowns">—</div></div></div></section><section class="card"><h2>Live Connections</h2><div class="table-wrap"><table><thead><tr><th>Protocol</th><th>Local IP</th><th>Local Port</th><th>Remote IP</th><th>Remote Port</th><th>Download</th><th>Upload</th><th>TCP State</th><th>Timeout</th></tr></thead><tbody id="connectionsBody"></tbody></table></div></section><?php endif;?></div><script>window.__initialPayload=<?=json_encode($data,JSON_UNESCAPED_SLASHES)?>;(function(){const $=id=>document.getElementById(id),hist=[],maxPts=20;let polling=false;function esc(v){return String(v??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#039;')}function draw(){const c=$('trafficGraph');if(!c||!hist.length)return;const x=c.getContext('2d'),w=c.width,h=c.height;x.clearRect(0,0,w,h);let m=1;hist.forEach(p=>m=Math.max(m,p.rx,p.tx));function line(k,col){x.beginPath();x.strokeStyle=col;x.lineWidth=2;hist.forEach((p,i)=>{const px=(i/(maxPts-1))*w,py=h-(p[k]/m)*(h-8)-4;i?x.lineTo(px,py):x.moveTo(px,py)});x.stroke()}line('rx','#22c55e');line('tx','#ef4444')}function render(d){if(!d)return;const i=d.interface||{};$('when').textContent=d.refreshedAt||'';$('mode').textContent=d.mode||'';$('status').textContent=i.disabled?'Disabled':(i.running?'Up':'Down');$('rx').textContent=i.rx_text||'—';$('tx').textContent=i.tx_text||'—';$('rxTotal').textContent=i.rx_total||'—';$('txTotal').textContent=i.tx_total||'—';$('type').textContent=i.type||'—';$('mac').textContent=i.mac||'—';$('mtu').textContent=(i.mtu||'—')+' / '+(i.l2mtu||'—');$('rxPackets').textContent=Number(i.rx_packets||0).toLocaleString();$('txPackets').textContent=Number(i.tx_packets||0).toLocaleString();$('queueDrops').textContent=Number(i.queue_drops||0).toLocaleString();$('linkDowns').textContent=i.link_downs||'0';const hosts=d.hosts||[],conns=d.connections||[];$('hostCount').textContent=hosts.length;$('connectionCount').textContent=conns.length;$('hostsBody').innerHTML=hosts.map(r=>'<tr><td class="mono">'+esc(r.ip)+'</td><td>'+esc(r.hostname||r.comment||'—')+'</td><td class="mono">'+esc(r.mac||'—')+'</td><td class="rx">'+esc(r.download_text)+'</td><td class="tx">'+esc(r.upload_text)+'</td><td>'+esc(r.connections)+'</td><td>'+esc(r.remote_count)+'</td><td class="mono">'+esc((r.remotes||[]).join(', ')||'—')+'</td></tr>').join('');$('connectionsBody').innerHTML=conns.map(r=>'<tr><td>'+esc(r.protocol)+'</td><td class="mono">'+esc(r.local_ip)+'</td><td>'+esc(r.local_port||'—')+'</td><td class="mono">'+esc(r.remote_ip)+'</td><td>'+esc(r.remote_port||'—')+'</td><td class="rx">'+esc(r.download_text)+'</td><td class="tx">'+esc(r.upload_text)+'</td><td>'+esc(r.tcp_state||'—')+'</td><td>'+esc(r.timeout||'—')+'</td></tr>').join('');hist.push({rx:Number(i.rx_bps||0),tx:Number(i.tx_bps||0)});if(hist.length>maxPts)hist.shift();draw()}async function poll(){if(polling)return;polling=true;$('pollStatus').textContent='Updating...';try{const u=new URL(location.href);u.searchParams.set('ajax','1');u.searchParams.set('t',Date.now());const r=await fetch(u,{cache:'no-store'}),d=await r.json();if(!r.ok||!d.ok)throw new Error(d.error||'Update failed');render(d);$('pollStatus').textContent='Live update every 3 seconds · 60 second graph'}catch(e){$('pollStatus').textContent='Update failed: '+e.message}finally{polling=false}}render(window.__initialPayload);setInterval(poll,3000)})();</script></body></html>
